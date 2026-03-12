@@ -14,8 +14,7 @@ This kernel is designed with edge capable hardware in mind, could scale in diffe
 **Independent Research Organization**
 
 **Date:** March 11, 2026  
-**Status:** Public Technical Disclosure Package  
-**Release Authorization:** Public Summary (Implementation Details Withheld)  
+**Status:** Public Technical Disclosure Package
 
 #### Reader's Guide
 This package presents a unified vision for persistent artificial intelligence:
@@ -140,8 +139,6 @@ Environmental Input → Representation → Prediction → Surprise Detection →
 
 **Strategic Shift**  
 From model-centric to cognition-centric: models interchangeable; intelligence from prediction + memory + control under causal invariant.
-
-**Planned Public Release**: Late June 2026 (expanded docs per IP/regulatory guidance).
 
 **Closing**  
 RCCA synthesizes computational intelligence, biological cognitive regulation, and physical causal systems into a unified kernel — foundational infrastructure for next-generation persistent autonomous AI.
