@@ -1,7 +1,8 @@
 # RCCA
 LAYER ZERO PHYSICS DRIVEN COGNITIVE AGI KERNEL PROTOTYPE
 ***VERY EARLY PROTOTYPE PHASE***
-CODE WILL HAVE MANY ERRORS UNTIL REFINED, BUILDING THE ARCHITECTURE FIRST
+CODE WILL HAVE MANY ERRORS UNTIL REFINED, BUILDING THE ARCHITECTURE FIRST.
+
 THIS AGENTIC ARCHITECTURE WORK IS BASED ON theoretical physics. 
 Decided to open source as work can be experimented on in laboratory settings.
 This kernel is designed with edge capable hardware in mind, could scale in different ways. 
