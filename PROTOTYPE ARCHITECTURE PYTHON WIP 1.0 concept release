@@ -1,0 +1,670 @@
+
+# ──────────────── PART 1: CORE & UTILITIES ────────────────
+import asyncio
+import threading
+import queue
+import random
+import numpy as np
+import time
+import hashlib
+import pickle
+import os
+import json
+from collections import defaultdict, deque
+from pathlib import Path
+import tkinter as tk
+from tkinter import scrolledtext, Label
+import PIL.Image, PIL.ImageTk
+import cv2
+
+# Optional speech support
+try:
+    import speech_recognition as sr
+    AUDIO_AVAILABLE = True
+except:
+    sr = None
+    AUDIO_AVAILABLE = False
+
+# Torch + Transformers
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+except:
+    torch = None
+    DEVICE = "cpu"
+
+# FAISS optional
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except:
+    FAISS_AVAILABLE = False
+
+# Directories
+SAVE_DIR = Path("frontier_agi_luna")
+SAVE_DIR.mkdir(exist_ok=True)
+MEM_DIR = SAVE_DIR / "memory"
+MEM_DIR.mkdir(exist_ok=True)
+
+# ──────────────── GLOBAL CONFIG ────────────────
+CONFIG = {
+    "embed_dim": 512,
+    "vlm_interval": 2.5, 
+    "reason_interval": 0.4, 
+    "max_vector_memory": 50000,
+    "surprise_threshold": 0.35,
+    "gru_reset_prob": 0.002
+}
+
+LOGICAL_STEP = 0
+def logical_step():
+    global LOGICAL_STEP
+    LOGICAL_STEP += 1
+    return LOGICAL_STEP
+
+# ──────────────── VECTOR UTILITIES ────────────────
+def normalize_vec(v):
+    v = np.asarray(v, dtype=np.float32)
+    norm = np.linalg.norm(v)
+    if norm < 1e-12:
+        return np.zeros_like(v)
+    return v / norm
+
+def cosine_similarity(a, b):
+    return float(np.dot(normalize_vec(a), normalize_vec(b)))
+
+def stable_embedding(text, dim):
+    seed = int(hashlib.sha256(text.encode()).hexdigest(), 16) % (2**32)
+    rng = np.random.default_rng(seed)
+    vec = rng.standard_normal(dim)
+    return normalize_vec(vec)
+
+# ──────────────── TIME UTILITIES ────────────────
+class RateLimiter:
+    def __init__(self, interval):
+        self.interval = interval
+        self.last = 0
+    def ready(self):
+        now = time.time()
+        if now - self.last >= self.interval:
+            self.last = now
+            return True
+        return False
+
+# ──────────────── REPRESENTATION ENGINE ────────────────
+class RepresentationEngine:
+    def __init__(self, dim=512):
+        self.dim = dim
+        self.text_weight = 0.50
+        self.image_weight = 0.35
+        self.motion_weight = 0.10
+        self.other_weight = 0.05
+        self.noise_floor = 1e-6
+
+    def text_embedding(self, text):
+        if text is None or len(text) == 0:
+            return np.zeros(self.dim)
+        return stable_embedding(text, self.dim)
+
+    def motion_embedding(self, motion_score):
+        vec = np.zeros(self.dim)
+        vec[0] = motion_score
+        return normalize_vec(vec)
+
+    def fuse(self, text_emb=None, image_emb=None, motion_emb=None, other=None):
+        parts = []
+        if text_emb is not None:
+            parts.append(self.text_weight * text_emb)
+        if image_emb is not None:
+            parts.append(self.image_weight * image_emb)
+        if motion_emb is not None:
+            parts.append(self.motion_weight * motion_emb)
+        if other is not None:
+            parts.append(self.other_weight * other)
+        if not parts:
+            return np.zeros(self.dim)
+        fused = np.sum(parts, axis=0)
+        return normalize_vec(fused)
+
+    def smooth_latent(self, current, previous=None, alpha=0.7):
+        if previous is None:
+            return current
+        smoothed = alpha * current + (1 - alpha) * previous
+        return normalize_vec(smoothed)
+
+    def compute_surprise(self, predicted, observed):
+        if predicted is None or observed is None:
+            return 0.0
+        diff = predicted - observed
+        return float(np.linalg.norm(diff))
+
+    def compute_attention(self, motion, surprise):
+        motion_factor = min(1.0, motion / 25.0)
+        surprise_factor = min(1.0, surprise)
+        attention = 0.6 * surprise_factor + 0.4 * motion_factor
+        return float(attention)
+
+# ──────────────── VECTOR MEMORY ────────────────
+class VectorMemory:
+    def __init__(self, dim):
+        self.dim = dim
+        self.meta = []
+        self.timestamps = []
+        self.max_memory = CONFIG["max_vector_memory"]
+        if FAISS_AVAILABLE:
+            self.index = faiss.IndexFlatL2(dim)
+        else:
+            self.index = None
+            self.vectors = []
+
+    def add(self, vec, meta=None):
+        vec = normalize_vec(vec)
+        if len(self.meta) >= self.max_memory:
+            self.prune()
+        if FAISS_AVAILABLE:
+            self.index.add(np.array([vec]).astype(np.float32))
+        else:
+            self.vectors.append(vec)
+        self.meta.append(meta)
+        self.timestamps.append(time.time())
+
+    def search(self, vec, k=5):
+        if len(self.meta) == 0:
+            return []
+        vec = normalize_vec(vec)
+        if FAISS_AVAILABLE:
+            k = min(k, len(self.meta))
+            D, I = self.index.search(np.array([vec]).astype(np.float32), k)
+            return [self.meta[idx] for idx in I[0] if idx < len(self.meta)]
+        else:
+            sims = [(cosine_similarity(vec, v), m) for v, m in zip(self.vectors, self.meta)]
+            sims.sort(reverse=True)
+            return [m for _, m in sims[:k]]
+
+    def recall_episode(self, vec, window=5):
+        results = self.search(vec, k=1)
+        if not results:
+            return []
+        target = results[0]
+        idx = self.meta.index(target)
+        start = max(0, idx - window)
+        end = min(len(self.meta), idx + window)
+        return self.meta[start:end]
+
+    def prune(self):
+        remove_count = int(len(self.meta) * 0.2)
+        if remove_count <= 0:
+            return
+        self.meta = self.meta[remove_count:]
+        self.timestamps = self.timestamps[remove_count:]
+        if FAISS_AVAILABLE:
+            self.index.reset()
+            vectors = [m["latent"] for m in self.meta if m and "latent" in m]
+            if vectors:
+                self.index.add(np.array(vectors).astype(np.float32))
+        else:
+            self.vectors = self.vectors[remove_count:]
+
+    def store_if_interesting(self, vec, meta, surprise, attention):
+        if surprise > CONFIG["surprise_threshold"] or attention > 0.7:
+            self.add(vec, meta)
+
+    def summary(self):
+        return {
+            "total_memories": len(self.meta),
+            "oldest_memory_age": time.time() - self.timestamps[0] if self.timestamps else 0
+        }
+# ──────────────── PART 2a: WORLD MODEL & SLOTS ────────────────
+class WorldModelSlot:
+    """
+    Represents a single slot in the Hierarchical Predictive World Model.
+    Each slot tracks latent state, dynamics, and attention.
+    """
+    def __init__(self, name, dim=512):
+        self.name = name
+        self.dim = dim
+        self.latent = np.zeros(dim)
+        self.prev_latent = np.zeros(dim)
+        self.predicted = np.zeros(dim)
+        self.attention = 0.0
+        self.motion = 0.0
+        self.surprise = 0.0
+        self.meta = {}
+        self.last_update = time.time()
+        self.gru_state = np.zeros(dim)
+
+    def update(self, observed, rep_engine: RepresentationEngine):
+        self.prev_latent = self.latent.copy()
+        self.surprise = rep_engine.compute_surprise(self.predicted, observed)
+        self.motion = np.linalg.norm(observed - self.prev_latent)
+        self.latent = rep_engine.smooth_latent(observed, self.prev_latent)
+        self.attention = rep_engine.compute_attention(self.motion, self.surprise)
+        self.last_update = time.time()
+        # GRU-style stochastic update
+        if random.random() < CONFIG["gru_reset_prob"]:
+            self.gru_state = np.zeros(self.dim)
+
+class HierarchicalPredictiveWorldModel:
+    """
+    Multi-slot hierarchical world model with prediction, attention, and episodic memory integration.
+    """
+    def __init__(self, num_slots=8, dim=512, rep_engine=None, vector_memory=None):
+        self.num_slots = num_slots
+        self.dim = dim
+        self.rep_engine = rep_engine or RepresentationEngine(dim)
+        self.vector_memory = vector_memory or VectorMemory(dim)
+        self.slots = [WorldModelSlot(f"slot_{i}", dim) for i in range(num_slots)]
+        self.hierarchy_levels = [self.slots[:num_slots//2], self.slots[num_slots//2:]]
+        self.last_prediction_time = time.time()
+
+    def encode_observation(self, observation):
+        """
+        Encodes a raw observation into a latent vector.
+        Supports text, motion, and optional image.
+        """
+        text_emb = observation.get("text_emb", None)
+        image_emb = observation.get("image_emb", None)
+        motion_emb = observation.get("motion_emb", None)
+        other = observation.get("other", None)
+        latent = self.rep_engine.fuse(text_emb, image_emb, motion_emb, other)
+        return latent
+
+    def predict_slot(self, slot: WorldModelSlot):
+        """
+        Predict next latent for a slot.
+        Here, simple autoregressive smoothing with noise can be replaced with neural predictor.
+        """
+        noise = np.random.normal(0, 0.01, self.dim)
+        slot.predicted = self.rep_engine.smooth_latent(slot.latent + noise, slot.prev_latent)
+        return slot.predicted
+
+    def update_slot(self, slot: WorldModelSlot, observation_vec):
+        slot.update(observation_vec, self.rep_engine)
+        # Store in vector memory if interesting
+        meta = {
+            "slot": slot.name,
+            "latent": slot.latent,
+            "attention": slot.attention,
+            "surprise": slot.surprise,
+            "timestamp": time.time()
+        }
+        self.vector_memory.store_if_interesting(slot.latent, meta, slot.surprise, slot.attention)
+
+    def step(self, observation_dicts):
+        """
+        Update world model with multiple observations.
+        observation_dicts: list of dicts with 'text_emb', 'image_emb', etc.
+        Each slot gets one observation (cycled if fewer than slots)
+        """
+        for i, slot in enumerate(self.slots):
+            obs = observation_dicts[i % len(observation_dicts)]
+            latent = self.encode_observation(obs)
+            self.predict_slot(slot)
+            self.update_slot(slot, latent)
+
+    def get_slot_latents(self):
+        return {slot.name: slot.latent for slot in self.slots}
+
+    def get_attentions(self):
+        return {slot.name: slot.attention for slot in self.slots}
+# ──────────────── PART 2b: EPISODIC MEMORY & CURIOSITY ────────────────
+class EpisodicMemory:
+    """
+    Maintains sequences of salient events for episodic recall.
+    """
+    def __init__(self, max_episodes=1000):
+        self.max_episodes = max_episodes
+        self.episodes = deque(maxlen=max_episodes)
+
+    def add_event(self, latent, meta=None):
+        self.episodes.append({
+            "latent": latent.copy(),
+            "meta": meta,
+            "timestamp": time.time()
+        })
+
+    def recall(self, query_vec, k=5):
+        if not self.episodes:
+            return []
+        sims = [(cosine_similarity(query_vec, e["latent"]), e) for e in self.episodes]
+        sims.sort(reverse=True)
+        return [e for _, e in sims[:k]]
+
+    def summarize(self):
+        return f"EpisodicMemory: {len(self.episodes)} events stored."
+
+# Curiosity-driven exploration
+class CuriosityModule:
+    """
+    Computes intrinsic reward based on surprise and attention in slots.
+    """
+    def __init__(self, alpha=0.7):
+        self.alpha = alpha
+
+    def compute_intrinsic_reward(self, slot: WorldModelSlot):
+        reward = self.alpha * slot.surprise + (1 - self.alpha) * slot.attention
+        return reward
+
+# Integration into world model
+class CognitiveWorld:
+    """
+    Full cognitive model wrapping HierarchicalPredictiveWorldModel, EpisodicMemory, Curiosity.
+    """
+    def __init__(self, num_slots=8, dim=512):
+        self.rep_engine = RepresentationEngine(dim)
+        self.vector_memory = VectorMemory(dim)
+        self.world_model = HierarchicalPredictiveWorldModel(
+            num_slots=num_slots, dim=dim, rep_engine=self.rep_engine, vector_memory=self.vector_memory
+        )
+        self.episodic_memory = EpisodicMemory(max_episodes=10000)
+        self.curiosity_module = CuriosityModule()
+
+    def step(self, observation_dicts):
+        self.world_model.step(observation_dicts)
+        # Store interesting slot latents in episodic memory
+        for slot in self.world_model.slots:
+            intrinsic_reward = self.curiosity_module.compute_intrinsic_reward(slot)
+            if intrinsic_reward > 0.35:
+                meta = {
+                    "attention": slot.attention,
+                    "surprise": slot.surprise,
+                    "reward": intrinsic_reward
+                }
+                self.episodic_memory.add_event(slot.latent, meta)
+# ──────────────── PART 3a: CORTICALTM CORE & THEORY OF MIND ────────────────
+class CorticalTM:
+    """
+    High-level cortical simulation for Theory of Mind reasoning.
+    Interfaces with the world model, episodic memory, and curiosity module.
+    """
+    def __init__(self, cognitive_world: CognitiveWorld):
+        self.cognitive_world = cognitive_world
+        self.belief_state = {}
+        self.intentions = {}
+        self.attention_matrix = np.zeros((cognitive_world.world_model.num_slots,
+                                          cognitive_world.world_model.num_slots))
+        self.last_update = time.time()
+
+    def infer_beliefs(self):
+        """
+        Uses slot latents and episodic memory to build beliefs about environment and agents.
+        """
+        latents = self.cognitive_world.world_model.get_slot_latents()
+        # Simple ToM inference: correlate slot surprises and attention
+        for name, latent in latents.items():
+            related_slots = [
+                s for s in self.cognitive_world.world_model.slots
+                if s.name != name and s.attention > 0.1
+            ]
+            self.belief_state[name] = {
+                "latent": latent,
+                "related": [s.name for s in related_slots],
+                "surprise": self.cognitive_world.world_model.slots[int(name[-1])].surprise
+            }
+
+    def plan_intentions(self):
+        """
+        Generates intentions based on beliefs and curiosity-driven intrinsic rewards.
+        """
+        self.infer_beliefs()
+        self.intentions = {}
+        for slot_name, belief in self.belief_state.items():
+            slot = self.cognitive_world.world_model.slots[int(slot_name[-1])]
+            reward = self.cognitive_world.curiosity_module.compute_intrinsic_reward(slot)
+            if reward > 0.4:
+                self.intentions[slot_name] = "explore"
+            elif reward > 0.2:
+                self.intentions[slot_name] = "monitor"
+            else:
+                self.intentions[slot_name] = "ignore"
+
+    def update(self):
+        """
+        Single CorticalTM step: infer, plan, and update internal attention matrix.
+        """
+        self.plan_intentions()
+        # Update attention matrix
+        for i, slot_i in enumerate(self.cognitive_world.world_model.slots):
+            for j, slot_j in enumerate(self.cognitive_world.world_model.slots):
+                self.attention_matrix[i, j] = 0.5 * slot_i.attention + 0.5 * slot_j.attention
+        self.last_update = time.time()
+# ──────────────── PART 3b: RAYRUN SCHEDULING + MULTIMODAL PERCEPTION ────────────────
+from concurrent.futures import ThreadPoolExecutor
+
+class RayRun:
+    """
+    Task scheduler for the cognitive system.
+    Supports asynchronous world model updates, CorticalTM reasoning, and perception fusion.
+    """
+    def __init__(self, cognitive_world: CognitiveWorld, cortical_tm: CorticalTM, max_workers=4):
+        self.cognitive_world = cognitive_world
+        self.cortical_tm = cortical_tm
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.tasks = []
+
+    def schedule_step(self, observation_dicts):
+        """
+        Schedule a full cognitive step: world model, CorticalTM, VLM perception.
+        """
+        def task():
+            # Step 1: Update world model
+            self.cognitive_world.step(observation_dicts)
+            # Step 2: Update CorticalTM reasoning
+            self.cortical_tm.update()
+            # Step 3: Optional: multimodal perception fusion
+            for obs in observation_dicts:
+                self.process_multimodal(obs)
+        future = self.executor.submit(task)
+        self.tasks.append(future)
+        return future
+
+    def process_multimodal(self, obs):
+        """
+        VLM-style perception: fuse text, image, and motion embeddings.
+        """
+        text_emb = obs.get("text_emb")
+        image_emb = obs.get("image_emb")
+        motion_emb = obs.get("motion_emb")
+        fused = self.cognitive_world.rep_engine.fuse(text_emb, image_emb, motion_emb)
+        # Store high-attention embeddings in vector memory
+        attention = np.mean([s.attention for s in self.cognitive_world.world_model.slots])
+        meta = {"source": "VLM_fusion", "attention": attention}
+        self.cognitive_world.vector_memory.store_if_interesting(fused, meta, surprise=0.1, attention=attention)
+        return fused
+
+    def wait_all(self):
+        """
+        Wait for all scheduled tasks to complete.
+        """
+        for f in self.tasks:
+            f.result()
+        self.tasks.clear()
+# ──────────────── PART 4a: MEMORY CONSOLIDATION & PREDICTION ────────────────
+class MemoryConsolidator:
+    """
+    Periodically consolidates episodic memory into long-term knowledge.
+    Updates world model predictions using consolidated experiences.
+    """
+    def __init__(self, cognitive_world: CognitiveWorld, cortical_tm: CorticalTM):
+        self.cognitive_world = cognitive_world
+        self.cortical_tm = cortical_tm
+        self.last_consolidation = time.time()
+        self.consolidation_interval = 120 # seconds
+
+    def consolidate(self):
+        """
+        Integrates high-surprise or high-attention experiences into long-term knowledge.
+        """
+        for slot in self.cognitive_world.world_model.slots:
+            if slot.surprise > 0.3 or slot.attention > 0.5:
+                self.cognitive_world.vector_memory.store_if_interesting(
+                    slot.latent, 
+                    meta={"source": "memory_consolidation", "slot": slot.name},
+                    surprise=slot.surprise,
+                    attention=slot.attention
+                )
+        # Update predictions in world model after consolidation
+        self.cognitive_world.world_model.update_predictions()
+        self.last_consolidation = time.time()
+
+    def maybe_consolidate(self):
+        """
+        Consolidate only if enough time has passed.
+        """
+        if time.time() - self.last_consolidation > self.consolidation_interval:
+            self.consolidate()
+# ──────────────── PART 4b: ADAPTIVE AGENT-ENVIRONMENT LOOP ────────────────
+class AdaptiveLoop:
+    """
+    Handles iterative interaction with the environment using CorticalTM reasoning,
+    RayRun scheduling, and feedback-driven adaptation.
+    """
+    def __init__(self, rayrun: RayRun, consolidator: MemoryConsolidator, max_iterations=1000):
+        self.rayrun = rayrun
+        self.consolidator = consolidator
+        self.iteration = 0
+        self.max_iterations = max_iterations
+
+    def step(self, observation_dicts):
+        """
+        Perform a single adaptive loop iteration:
+        1. Schedule perception & reasoning
+        2. Consolidate memory
+        3. Integrate feedback
+        """
+        future = self.rayrun.schedule_step(observation_dicts)
+        future.result() # Wait for completion
+
+        # Memory consolidation
+        self.consolidator.maybe_consolidate()
+
+        # Adaptive feedback: modify attention based on CorticalTM intentions
+        for slot_name, intention in self.rayrun.cortical_tm.intentions.items():
+            slot = self.rayrun.cognitive_world.world_model.slots[int(slot_name[-1])]
+            if intention == "explore":
+                slot.attention = min(1.0, slot.attention + 0.1)
+            elif intention == "ignore":
+                slot.attention = max(0.0, slot.attention - 0.1)
+
+        self.iteration += 1
+
+    def run(self, observation_sequence):
+        """
+        Run the full adaptive loop over a sequence of observations.
+        """
+        for obs_batch in observation_sequence:
+            if self.iteration >= self.max_iterations:
+                break
+            self.step(obs_batch)
+# ──────────────── PART 5: RAYRUN LUNA ORCHESTRATOR ────────────────
+class RayRunLuna:
+    """
+    Fully integrated AGI agent with:
+    - Hierarchical world model (visual + multimodal)
+    - CorticalTM emergent reasoning
+    - Episodic memory + vector memory
+    - Adaptive loop + memory consolidation
+    - RayRun scheduling for asynchronous perception and reasoning
+    """
+    def __init__(self, luna: Luna, embed_dim=512):
+        self.luna = luna
+        self.embed_dim = embed_dim
+
+        # Initialize CorticalTM manager
+        self.cortical_tm = CorticalToMManager(embed_dim=embed_dim, initial_sub_agents=50)
+
+        # Cognitive world wrapper
+        self.cognitive_world = luna.world_model
+
+        # Memory consolidator
+        self.consolidator = MemoryConsolidator(
+            cognitive_world=self.cognitive_world,
+            cortical_tm=self.cortical_tm
+        )
+
+        # Adaptive loop
+        self.adaptive_loop = AdaptiveLoop(
+            rayrun=self,
+            consolidator=self.consolidator,
+            max_iterations=10000
+        )
+
+        # For scheduling steps and storing intentions
+        self.intentions = {}
+
+        print("[RayRunLuna] Initialization complete.")
+
+    # -------------------- Step Scheduling --------------------
+    def schedule_step(self, observation_dicts):
+        """
+        Simulate asynchronous perception & reasoning.
+        observation_dicts: list of frame/feature dictionaries
+        Returns a future-like object
+        """
+        class DummyFuture:
+            def result(self_inner):
+                for obs in observation_dicts:
+                    fused_latent = torch.tensor(obs["fused_latent"]).unsqueeze(0).to(DEVICE)
+
+                    # CorticalTM perception update
+                    cortical_belief = self.cortical_tm.update_all_modules(fused_latent)
+
+                    # Record intentions based on surprise
+                    surprise_score = torch.norm(cortical_belief - fused_latent).item()
+                    role_intention = "explore" if surprise_score > 0.6 else "ignore"
+                    self.intentions[f"slot_{len(self.intentions)}"] = role_intention
+
+                    # Add to Luna vector memory
+                    self.luna.vector_mem.add(obs["fused_latent"], meta={
+                        "caption": obs.get("caption", ""),
+                        "timestamp": time.time(),
+                        "surprise": surprise_score
+                    })
+
+                    # Optional: train world model with latent
+                    self.luna.train_world_model()
+
+        return DummyFuture()
+
+    # -------------------- Run Observations --------------------
+    def run_observation_sequence(self, observation_sequence):
+        """
+        Run a sequence of observations through the full adaptive system
+        """
+        print("[RayRunLuna] Starting adaptive observation loop...")
+        self.adaptive_loop.run(observation_sequence)
+        print("[RayRunLuna] Adaptive loop complete.")
+
+    # -------------------- High-Level Agent Interface --------------------
+    def perceive_and_act(self, frame):
+        """
+        1. Process new frame
+        2. Extract features
+        3. Update CorticalTM and world model
+        4. Return current belief and suggested action
+        """
+        self.luna.on_new_frame(frame)
+        features = self.luna.extract_multimodal_features()
+        if features is None:
+            return None, None
+
+        fused_latent = torch.tensor(features["fused_latent"]).unsqueeze(0).to(DEVICE)
+        cortical_belief = self.cortical_tm.update_all_modules(fused_latent)
+
+        # Plan next action using Monte Carlo planner
+        action = self.luna.world_model.planner.plan(cortical_belief)
+
+        # Record in memory
+        surprise_score = torch.norm(cortical_belief - fused_latent).item()
+        self.luna.vector_mem.add(features["fused_latent"], meta={
+            "caption": features.get("caption", ""),
+            "timestamp": time.time(),
+            "surprise": surprise_score
+        })
+
+        return cortical_belief, action
+
